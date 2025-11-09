@@ -1,0 +1,246 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "clusterName": {
+      "type": "string",
+      "defaultValue": "[concat('aks-cluster-', uniqueString(resourceGroup().id))]",
+      "metadata": {
+        "description": "Name of the AKS cluster"
+      }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "Location for all resources"
+      }
+    },
+    "nodeCount": {
+      "type": "int",
+      "defaultValue": 3,
+      "minValue": 3,
+      "maxValue": 10,
+      "metadata": {
+        "description": "Number of nodes in the agent pool"
+      }
+    },
+    "nodeVmSize": {
+      "type": "string",
+      "defaultValue": "Standard_B2s",
+      "metadata": {
+        "description": "Size of the VMs in the agent pool"
+      }
+    },
+    "kubernetesVersion": {
+      "type": "string",
+      "defaultValue": "1.31",
+      "metadata": {
+        "description": "Kubernetes version"
+      }
+    },
+    "dnsPrefix": {
+      "type": "string",
+      "defaultValue": "[concat('aks-', uniqueString(resourceGroup().id))]",
+      "metadata": {
+        "description": "DNS prefix for the AKS cluster"
+      }
+    },
+    "servicePrincipalClientId": {
+      "type": "string",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Service principal client ID (appId). If not provided, a managed identity will be used."
+      }
+    },
+    "servicePrincipalClientSecret": {
+      "type": "securestring",
+      "defaultValue": "",
+      "metadata": {
+        "description": "Service principal client secret. Required if servicePrincipalClientId is provided."
+      }
+    },
+    "helmRegistry": {
+      "type": "string",
+      "metadata": {
+        "description": "Helm OCI registry URL"
+      }
+    },
+    "helmRegistryUser": {
+      "type": "string",
+      "metadata": {
+        "description": "Helm registry username"
+      }
+    },
+    "helmRegistryPassword": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Helm registry password"
+      }
+    },
+    "helmChartName": {
+      "type": "string",
+      "metadata": {
+        "description": "Name of the Helm chart to install"
+      }
+    },
+    "helmChartVersion": {
+      "type": "string",
+      "metadata": {
+        "description": "Version of the Helm chart to install"
+      }
+    },
+    "dockerConfigJson": {
+      "type": "securestring",
+      "metadata": {
+        "description": "Base64 encoded docker config JSON for registry credentials"
+      }
+    }
+  },
+  "variables": {
+    "useManagedIdentity": "[empty(parameters('servicePrincipalClientId'))]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.ContainerService/managedClusters",
+      "apiVersion": "2023-11-01",
+      "name": "[parameters('clusterName')]",
+      "location": "[parameters('location')]",
+      "identity": "[if(variables('useManagedIdentity'), createObject('type', 'SystemAssigned'), json('null'))]",
+      "properties": {
+        "kubernetesVersion": "[parameters('kubernetesVersion')]",
+        "dnsPrefix": "[parameters('dnsPrefix')]",
+        "agentPoolProfiles": [
+          {
+            "name": "agentpool",
+            "count": "[parameters('nodeCount')]",
+            "vmSize": "[parameters('nodeVmSize')]",
+            "osType": "Linux",
+            "mode": "System",
+            "type": "VirtualMachineScaleSets",
+            "enableAutoScaling": false
+          }
+        ],
+        "servicePrincipalProfile": "[if(variables('useManagedIdentity'), json('null'), createObject('clientId', parameters('servicePrincipalClientId'), 'secret', parameters('servicePrincipalClientSecret')))]",
+        "networkProfile": {
+          "networkPlugin": "kubenet",
+          "loadBalancerSku": "Standard",
+          "loadBalancerProfile": {
+            "managedOutboundIPs": {
+              "count": 1
+            }
+          }
+        },
+        "addonProfiles": {
+          "httpApplicationRouting": {
+            "enabled": false
+          }
+        },
+        "enableRBAC": true
+      }
+    },
+    {
+      "type": "Microsoft.Resources/deploymentScripts",
+      "apiVersion": "2023-08-01",
+      "name": "[concat('deploy-graphpolaris-services-', uniqueString(resourceGroup().id))]",
+      "location": "[parameters('location')]",
+      "kind": "AzureCLI",
+      "dependsOn": [
+        "[resourceId('Microsoft.ContainerService/managedClusters', parameters('clusterName'))]"
+      ],
+      "identity": {
+        "type": "UserAssigned",
+        "userAssignedIdentities": {
+          "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', concat('id-', uniqueString(resourceGroup().id)))]": {}
+        }
+      },
+      "properties": {
+        "azCliVersion": "2.50.0",
+        "timeout": "PT30M",
+        "retentionInterval": "P1D",
+        "environmentVariables": [
+          {
+            "name": "CLUSTER_NAME",
+            "value": "[parameters('clusterName')]"
+          },
+          {
+            "name": "RESOURCE_GROUP",
+            "value": "[resourceGroup().name]"
+          },
+          {
+            "name": "SUBSCRIPTION_ID",
+            "value": "[subscription().subscriptionId]"
+          },
+          {
+            "name": "HELM_REGISTRY",
+            "value": "[parameters('helmRegistry')]"
+          },
+          {
+            "name": "HELM_REGISTRY_USER",
+            "value": "[parameters('helmRegistryUser')]"
+          },
+          {
+            "name": "HELM_REGISTRY_PASSWORD",
+            "value": "[parameters('helmRegistryPassword')]"
+          },
+          {
+            "name": "HELM_CHART_NAME",
+            "value": "[parameters('helmChartName')]"
+          },
+          {
+            "name": "HELM_CHART_VERSION",
+            "value": "[parameters('helmChartVersion')]"
+          },
+          {
+            "name": "DOCKER_CONFIG_JSON",
+            "value": "[parameters('dockerConfigJson')]"
+          }
+        ],
+        "scriptContent": "#!/bin/bash\nset -e\n\n# Set the subscription explicitly (managed identity is already authenticated)\naz account set --subscription $SUBSCRIPTION_ID\n\n# Verify subscription\naz account show --output table\n\n# Install kubectl if not available\nif ! command -v kubectl &> /dev/null; then\n  echo \"Installing kubectl...\"\n  # Try az aks install-cli first, fallback to direct download\n  if ! az aks install-cli 2>/dev/null; then\n    KUBECTL_VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt)\n    curl -LO \"https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl\"\n    chmod +x kubectl\n    sudo mv kubectl /usr/local/bin/kubectl || mv kubectl /usr/local/bin/kubectl\n  fi\n  kubectl version --client\nfi\n\n# Install Helm if not available\nif ! command -v helm &> /dev/null; then\n  echo \"Installing Helm...\"\n  curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash\n  helm version\nfi\n\n# Install jq if not available\nif ! command -v jq &> /dev/null; then\n  echo \"Installing jq...\"\n  sudo apt-get update && sudo apt-get install -y jq || \\\n  (curl -L https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-amd64 -o /tmp/jq && chmod +x /tmp/jq && sudo mv /tmp/jq /usr/local/bin/jq)\n  jq --version\nfi\n\n# Get AKS credentials using admin (simpler, doesn't require cluster user role)\naz aks get-credentials --resource-group $RESOURCE_GROUP --name $CLUSTER_NAME --admin --overwrite-existing\n\n# Wait for nodes to be ready\nkubectl wait --for=condition=Ready nodes --all --timeout=300s || true\n\n# Enable OCI support for Helm\nexport HELM_EXPERIMENTAL_OCI=1\n\n# Login to Helm registry\necho \"Logging in to Helm registry $HELM_REGISTRY...\"\necho \"$HELM_REGISTRY_PASSWORD\" | helm registry login -u \"$HELM_REGISTRY_USER\" --password-stdin \"https://$HELM_REGISTRY\"\n\n# Install graphpolaris-services Helm chart\necho \"Installing $HELM_CHART_NAME chart version $HELM_CHART_VERSION...\"\n\n# Create values file with dockerconfigjson\necho \"Creating Helm values file...\"\nif [ -z \"$DOCKER_CONFIG_JSON\" ]; then\n  echo \"WARNING: DOCKER_CONFIG_JSON is empty. Image pulls may fail!\"\nfi\ncat > /tmp/helm-values.yaml <<EOF\nglobal:\n  registryCredentials:\n    dockerconfigjson: \"$DOCKER_CONFIG_JSON\"\nEOF\n\necho \"Helm values file created:\"\ncat /tmp/helm-values.yaml | sed 's/dockerconfigjson:.*/dockerconfigjson: [REDACTED]/'\n\nhelm upgrade --install graphpolaris-services \\\n  \"oci://$HELM_REGISTRY/graphpolaris-helm/$HELM_CHART_NAME\" \\\n  --version \"$HELM_CHART_VERSION\" \\\n  -f /tmp/helm-values.yaml \\\n  --wait --timeout 15m\n\n# Wait for all deployments to be ready\necho \"Waiting for all deployments to be ready...\"\nkubectl wait --for=condition=available --timeout=600s deployment --all --all-namespaces || true\n\n# Get all LoadBalancer service IPs\necho \"\\n=== LoadBalancer Service IPs ===\"\nLOADBALANCER_SERVICES=$(kubectl get svc --all-namespaces -o json | jq -r '.items[] | select(.spec.type==\"LoadBalancer\") | \"\\(.metadata.namespace)/\\(.metadata.name)\"')\n\nif [ -z \"$LOADBALANCER_SERVICES\" ]; then\n  echo \"No LoadBalancer services found yet. Waiting...\"\n  sleep 30\n  LOADBALANCER_SERVICES=$(kubectl get svc --all-namespaces -o json | jq -r '.items[] | select(.spec.type==\"LoadBalancer\") | \"\\(.metadata.namespace)/\\(.metadata.name)\"')\nfi\n\n# Wait for LoadBalancer IPs to be assigned\nRETRY=0\nMAX_RETRIES=30\n\nwhile [ $RETRY -lt $MAX_RETRIES ]; do\n  ALL_IPS_ASSIGNED=true\n  \n  echo \"\\nChecking LoadBalancer IPs (attempt $((RETRY + 1))/$MAX_RETRIES)...\"\n  \n  for service in $LOADBALANCER_SERVICES; do\n    NAMESPACE=$(echo $service | cut -d'/' -f1)\n    SERVICE_NAME=$(echo $service | cut -d'/' -f2)\n    IP=$(kubectl get svc $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo \"\")\n    \n    if [ -z \"$IP\" ]; then\n      ALL_IPS_ASSIGNED=false\n      echo \"  $NAMESPACE/$SERVICE_NAME: Pending...\"\n    else\n      echo \"  $NAMESPACE/$SERVICE_NAME: $IP\"\n    fi\n  done\n  \n  if [ \"$ALL_IPS_ASSIGNED\" = true ] && [ -n \"$LOADBALANCER_SERVICES\" ]; then\n    break\n  fi\n  \n  RETRY=$((RETRY + 1))\n  if [ $RETRY -lt $MAX_RETRIES ]; then\n    sleep 10\n  fi\n  \n  # Refresh service list\n  LOADBALANCER_SERVICES=$(kubectl get svc --all-namespaces -o json | jq -r '.items[] | select(.spec.type==\"LoadBalancer\") | \"\\(.metadata.namespace)/\\(.metadata.name)\"')\ndone\n\n# Output final LoadBalancer IPs\necho \"\\n=== Final LoadBalancer Service IPs ===\"\nfor service in $LOADBALANCER_SERVICES; do\n  NAMESPACE=$(echo $service | cut -d'/' -f1)\n  SERVICE_NAME=$(echo $service | cut -d'/' -f2)\n  IP=$(kubectl get svc $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo \"Pending\")\n  PORT=$(kubectl get svc $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo \"N/A\")\n  echo \"$NAMESPACE/$SERVICE_NAME: $IP:$PORT\"\ndone\n\n# Store LoadBalancer IPs in a file for outputs\ncat > /tmp/loadbalancer-ips.json <<EOF\n{\nEOF\n\nFIRST=true\nfor service in $LOADBALANCER_SERVICES; do\n  NAMESPACE=$(echo $service | cut -d'/' -f1)\n  SERVICE_NAME=$(echo $service | cut -d'/' -f2)\n  IP=$(kubectl get svc $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo \"Pending\")\n  PORT=$(kubectl get svc $SERVICE_NAME -n $NAMESPACE -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo \"N/A\")\n  \n  if [ \"$FIRST\" = false ]; then\n    echo \",\" >> /tmp/loadbalancer-ips.json\n  fi\n  FIRST=false\n  \n  SERVICE_KEY=$(echo \"$NAMESPACE-$SERVICE_NAME\" | tr '/' '-' | tr '[:upper:]' '[:lower:]')\n  cat >> /tmp/loadbalancer-ips.json <<EOF\n  \"$SERVICE_KEY\": {\n    \"namespace\": \"$NAMESPACE\",\n    \"service\": \"$SERVICE_NAME\",\n    \"ip\": \"$IP\",\n    \"port\": \"$PORT\"\n  }\nEOF\ndone\n\necho \"}\" >> /tmp/loadbalancer-ips.json\n\ncat /tmp/loadbalancer-ips.json\n"
+      }
+    },
+    {
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2023-01-31",
+      "name": "[concat('id-', uniqueString(resourceGroup().id))]",
+      "location": "[parameters('location')]"
+    },
+    {
+      "type": "Microsoft.Authorization/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[guid(resourceGroup().id, 'aks-deployment-script-rg-contributor')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', concat('id-', uniqueString(resourceGroup().id)))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b24988ac-6180-42a0-ab88-20f7382dd24c')]",
+        "principalId": "[reference(resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', concat('id-', uniqueString(resourceGroup().id)))).principalId]",
+        "principalType": "ServicePrincipal",
+        "scope": "[resourceGroup().id]"
+      }
+    }
+  ],
+  "outputs": {
+    "clusterName": {
+      "type": "string",
+      "value": "[parameters('clusterName')]"
+    },
+    "resourceGroup": {
+      "type": "string",
+      "value": "[resourceGroup().name]"
+    },
+    "kubeConfigCommand": {
+      "type": "string",
+      "value": "[concat('az aks get-credentials --resource-group ', resourceGroup().name, ' --name ', parameters('clusterName'))]"
+    },
+    "loadBalancerIPs": {
+      "type": "string",
+      "value": "[concat('Check deployment script output or run: kubectl get svc --all-namespaces -o wide | grep LoadBalancer')]"
+    },
+    "getLoadBalancerIPsCommand": {
+      "type": "string",
+      "value": "[concat('kubectl get svc --all-namespaces -o wide | grep LoadBalancer')]"
+    }
+  }
+}
+
