@@ -14,8 +14,8 @@ This Azure Resource Manager (ARM) template deploys a complete AKS cluster with t
 
 2. **GraphPolaris Services Stack**
    - Automatically installs the GraphPolaris Helm chart
-   - Deploys all GraphPolaris microservices (frontend, database service, client gateway, graph designer, etc.)
-   - Configures required third-party services (RabbitMQ, Redis, PostgreSQL)
+   - Deploys all GraphPolaris microservices
+   - Configures required third-party services
 
 ### Prerequisites
 
